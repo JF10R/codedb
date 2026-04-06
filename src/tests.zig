@@ -3217,7 +3217,7 @@ test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" 
             ctx.exp.mu.lock();
             defer ctx.exp.mu.unlock();
             ctx.exp.trigram_index.deinit();
-            ctx.exp.trigram_index = TrigramIndex.init(ctx.exp.allocator);
+            ctx.exp.trigram_index = .{ .heap = TrigramIndex.init(ctx.exp.allocator) };
             ctx.swapped.store(true, .release);
         }
     };
@@ -4569,4 +4569,131 @@ test "issue-116: getGitHead returns valid SHA for git repos" {
             try testing.expect(std.ascii.isHex(c));
         }
     }
+}
+
+const MmapTrigramIndex = @import("index.zig").MmapTrigramIndex;
+const AnyTrigramIndex = @import("index.zig").AnyTrigramIndex;
+
+test "issue-164: mmap trigram index returns same candidates as heap index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.zig", "pub fn handleAuth(req: *Request) !void { validate(req); }");
+    try explorer.indexFile("src/gate.zig", "pub fn checkGate(ctx: *Context) !bool { return ctx.authenticated; }");
+    try explorer.indexFile("src/util.zig", "pub fn formatStr(buf: []u8, args: anytype) !void {}");
+
+    // Get heap candidates
+    const heap_results = explorer.trigram_index.candidates("handleAuth", allocator) orelse
+        return error.NoCandidates;
+
+    try testing.expect(heap_results.len >= 1);
+
+    // Write to disk, load as mmap
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    try explorer.trigram_index.writeToDisk(tmp_path, null);
+
+    var mmap_idx = MmapTrigramIndex.initFromDisk(tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+    defer mmap_idx.deinit();
+
+    // mmap candidates should match heap candidates
+    const mmap_results = mmap_idx.candidates("handleAuth", allocator) orelse
+        return error.NoCandidates;
+
+    try testing.expect(mmap_results.len >= 1);
+    try testing.expectEqual(heap_results.len, mmap_results.len);
+
+    // Verify file count matches
+    try testing.expectEqual(explorer.trigram_index.fileCount(), mmap_idx.fileCount());
+
+    // Verify containsFile works
+    try testing.expect(mmap_idx.containsFile("src/auth.zig"));
+    try testing.expect(mmap_idx.containsFile("src/gate.zig"));
+    try testing.expect(!mmap_idx.containsFile("nonexistent.zig"));
+}
+
+test "issue-164: mmap binary search on sorted lookup table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Index enough files to exercise binary search paths
+    try explorer.indexFile("a.zig", "const alpha = 42;");
+    try explorer.indexFile("b.zig", "const beta = 43;");
+    try explorer.indexFile("c.zig", "const gamma = 44;");
+    try explorer.indexFile("d.zig", "const delta = 45;");
+    try explorer.indexFile("e.zig", "const alpha_beta = 99;");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    try explorer.trigram_index.writeToDisk(tmp_path, null);
+
+    var mmap_idx = MmapTrigramIndex.initFromDisk(tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+    defer mmap_idx.deinit();
+
+    // "alpha" appears in a.zig and e.zig
+    const results = mmap_idx.candidates("alpha", allocator) orelse
+        return error.NoCandidates;
+    try testing.expect(results.len >= 2);
+
+    // Query that matches nothing
+    const no_results = mmap_idx.candidates("zzzzz", allocator);
+    if (no_results) |nr| {
+        try testing.expectEqual(@as(usize, 0), nr.len);
+    }
+}
+
+test "issue-164: mmap handles missing files gracefully" {
+    // initFromDisk should return null for non-existent directory
+    const result = MmapTrigramIndex.initFromDisk("/tmp/nonexistent-codedb-test-dir-164", testing.allocator);
+    try testing.expect(result == null);
+}
+
+test "issue-164: AnyTrigramIndex dispatches to mmap variant" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("foo.zig", "pub fn fooBar(x: i32) i32 { return x + 1; }");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    try explorer.trigram_index.writeToDisk(tmp_path, null);
+
+    // Swap to mmap via AnyTrigramIndex
+    const mmap_loaded = MmapTrigramIndex.initFromDisk(tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+
+    explorer.trigram_index.deinit();
+    explorer.trigram_index = .{ .mmap = mmap_loaded };
+
+    // Search through Explorer (uses AnyTrigramIndex dispatch)
+    const results = try explorer.searchContent("fooBar", allocator, 10);
+    try testing.expect(results.len >= 1);
+
+    // containsFile through AnyTrigramIndex
+    try testing.expect(explorer.trigram_index.containsFile("foo.zig"));
+    try testing.expect(!explorer.trigram_index.containsFile("bar.zig"));
 }
